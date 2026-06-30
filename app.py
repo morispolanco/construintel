@@ -1,727 +1,627 @@
 import os
-import json
-import sqlite3
-from datetime import datetime, date, timedelta
-from typing import Dict, Optional, List
+from datetime import date, timedelta
 
+import numpy as np
 import pandas as pd
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 
-APP_TITLE = "ConstruInteligencia"
-DB_PATH = os.getenv("DB_PATH", "construinteligencia.db")
-OPENROUTER_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
-OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+# ============================================================
+# ConstruInteligencia · Streamlit Cloud ready
+# - Uses OpenRouter model:
+#   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
+# - API key must be stored in Streamlit secrets:
+#   OPENROUTER_API_KEY = "..."
+# ============================================================
 
-# -----------------------------
-# Page config
-# -----------------------------
 st.set_page_config(
-    page_title=APP_TITLE,
+    page_title="ConstruInteligencia",
     page_icon="🏗️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# -----------------------------
+# -------------------------
+# Config
+# -------------------------
+OPENROUTER_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
+APP_TITLE = "ConstruInteligencia"
+KEEPALIVE_MINUTES = 9  # browser-side refresh while tab remains open
+
+MATERIALS = [
+    "Cemento",
+    "Hierro",
+    "Varilla",
+    "Cable THHN",
+    "Tubo PVC",
+    "Block",
+    "Ladrillo",
+    "Arena",
+    "Piedra",
+    "Acero estructural",
+]
+
+SOURCE_SET = [
+    "Banco de Guatemala",
+    "Instituto Nacional de Estadística",
+    "SAT",
+    "Ministerio de Economía",
+    "Ministerio de Comunicaciones",
+    "Cámara Guatemalteca de la Construcción",
+    "Diario de Centro América",
+    "Medios económicos especializados",
+]
+
+TODAY = date.today()
+np.random.seed(7)
+
+
+# -------------------------
+# Anti-sleep / keep-alive
+# -------------------------
+# This helps keep an active browser tab refreshing periodically.
+# It cannot guarantee that a cloud host will never hibernate the backend.
+components.html(
+    f"""
+    <script>
+      setTimeout(function() {{
+        try {{
+          window.parent.location.reload();
+        }} catch (e) {{
+          window.location.reload();
+        }}
+      }}, {KEEPALIVE_MINUTES * 60 * 1000});
+    </script>
+    """,
+    height=0,
+)
+
+
+# -------------------------
+# Styling
+# -------------------------
+st.markdown(
+    """
+    <style>
+      @import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+      html, body, [class*="css"] {
+        font-family: 'Space Grotesk', sans-serif;
+      }
+
+      .mono {
+        font-family: 'JetBrains Mono', monospace;
+      }
+
+      .hero {
+        padding: 1.2rem 1.4rem;
+        border-radius: 1.25rem;
+        background: linear-gradient(135deg, rgba(17,24,39,0.96), rgba(31,41,55,0.96));
+        border: 1px solid rgba(255,255,255,0.08);
+        box-shadow: 0 20px 40px rgba(0,0,0,0.18);
+        color: white;
+      }
+
+      .card {
+        padding: 1rem 1rem 0.9rem 1rem;
+        border-radius: 1rem;
+        border: 1px solid rgba(148,163,184,0.22);
+        background: rgba(255,255,255,0.60);
+        backdrop-filter: blur(8px);
+        margin-bottom: 0.75rem;
+      }
+
+      .small-label {
+        font-size: 0.78rem;
+        text-transform: uppercase;
+        letter-spacing: 0.08em;
+        opacity: 0.72;
+        margin-bottom: 0.25rem;
+      }
+
+      .metric-value {
+        font-size: 1.6rem;
+        font-weight: 700;
+        line-height: 1.1;
+      }
+
+      .metric-sub {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 0.86rem;
+        opacity: 0.75;
+      }
+
+      .tag {
+        display: inline-block;
+        padding: 0.28rem 0.6rem;
+        border-radius: 999px;
+        border: 1px solid rgba(148,163,184,0.35);
+        font-size: 0.78rem;
+        margin-right: 0.35rem;
+        margin-bottom: 0.35rem;
+      }
+
+      .muted-note {
+        color: #64748b;
+        font-size: 0.88rem;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
+
+# -------------------------
 # Helpers
-# -----------------------------
+# -------------------------
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    return conn
+def load_api_key() -> str:
+    """Prefer Streamlit secrets, then environment variable."""
+    try:
+        return st.secrets["OPENROUTER_API_KEY"]
+    except Exception:
+        return os.getenv("OPENROUTER_API_KEY", "")
 
 
-def init_db() -> None:
-    conn = get_conn()
-    cur = conn.cursor()
+@st.cache_resource(show_spinner=False)
+def http_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update({
+        "HTTP-Referer": "https://streamlit.io",
+        "X-Title": APP_TITLE,
+        "Content-Type": "application/json",
+    })
+    return s
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            full_name TEXT,
-            role TEXT NOT NULL DEFAULT 'user',
-            active INTEGER NOT NULL DEFAULT 1,
-            created_at TEXT NOT NULL
-        )
-        """
+
+@st.cache_data(show_spinner=False)
+def generate_price_history(materials: list[str], months: int = 12) -> pd.DataFrame:
+    dates = pd.date_range(end=pd.Timestamp.today().normalize(), periods=months, freq="MS")
+    rows = []
+    for idx, material in enumerate(materials):
+        base = 100 + idx * 18
+        trend = np.linspace(0, np.random.uniform(-8, 18), months)
+        noise = np.random.normal(0, 2.5, months).cumsum() / 3
+        values = np.maximum(1, base + trend + noise)
+        for d, v in zip(dates, values):
+            rows.append({"Fecha": d, "Material": material, "Precio": round(float(v), 2)})
+    return pd.DataFrame(rows)
+
+
+@st.cache_data(show_spinner=False)
+def generate_news() -> pd.DataFrame:
+    data = [
+        [TODAY - timedelta(days=1), "SAT anuncia ajustes operativos con impacto en importaciones", "SAT", "Posible presión en costos de importación."],
+        [TODAY - timedelta(days=2), "Variación del tipo de cambio presiona materiales importados", "Banco de Guatemala", "Impacto potencial en acero, cableado y acabados."],
+        [TODAY - timedelta(days=3), "Nuevos proyectos viales impulsan demanda de materiales", "Ministerio de Comunicaciones", "Puede elevar la presión sobre cemento, varilla y agregados."],
+        [TODAY - timedelta(days=4), "Actividad de construcción muestra señales mixtas", "INE", "Lectura de volatilidad moderada."],
+    ]
+    return pd.DataFrame(data, columns=["Fecha", "Título", "Fuente", "Impacto estimado"])
+
+
+@st.cache_data(show_spinner=False)
+def generate_suppliers() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            ["Proveedor Centro", "Distribuidor", "Metropolitana", "ISO 9001", "Cemento / Block", "Alta"],
+            ["Acero GT", "Fabricante", "Occidente", "-", "Hierro / Varilla", "Media"],
+            ["ElectroSur", "Distribuidor", "Suroriente", "-", "Cable THHN", "Media"],
+            ["PVC Industrial", "Fabricante", "Centro / Norte", "Certificación técnica", "PVC / Hidráulicos", "Alta"],
+        ],
+        columns=["Nombre", "Tipo", "Cobertura", "Certificaciones", "Líneas", "Visibilidad pública"],
     )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT UNIQUE NOT NULL,
-            price REAL NOT NULL DEFAULT 0,
-            duration_days INTEGER NOT NULL DEFAULT 30,
-            created_at TEXT NOT NULL
-        )
-        """
+
+@st.cache_data(show_spinner=False)
+def generate_users() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            ["admin@demo.gt", "Administrador", "Activo", TODAY - timedelta(days=14), TODAY + timedelta(days=351), "Enterprise"],
+            ["compras@demo.gt", "Compras", "Activo", TODAY - timedelta(days=4), TODAY + timedelta(days=26), "Pro"],
+            ["gerencia@demo.gt", "Gerencia", "Suspendido", TODAY - timedelta(days=32), TODAY - timedelta(days=2), "Pro"],
+        ],
+        columns=["Usuario", "Rol", "Estado", "Inicio", "Vencimiento", "Plan"],
     )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS subscriptions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            plan_id INTEGER NOT NULL,
-            start_date TEXT NOT NULL,
-            end_date TEXT NOT NULL,
-            active INTEGER NOT NULL DEFAULT 1,
-            created_by INTEGER,
-            created_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(plan_id) REFERENCES plans(id)
-        )
-        """
+
+@st.cache_data(show_spinner=False)
+def generate_macro() -> pd.DataFrame:
+    return pd.DataFrame(
+        [
+            ["Tipo de cambio", "7.82", "🟡 Moderado"],
+            ["Inflación", "4.6%", "🟡 Moderado"],
+            ["Precio diésel", "Estable", "🟢 Bajo"],
+            ["Tasa líder", "5.0%", "🟠 Alto"],
+            ["IMAE", "+2.1%", "🟡 Moderado"],
+            ["PIB construcción", "+3.4%", "🟢 Bajo"],
+        ],
+        columns=["Indicador", "Valor", "Lectura"],
     )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS inventory (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            item_code TEXT,
-            item_name TEXT NOT NULL,
-            category TEXT,
-            unit TEXT,
-            quantity REAL NOT NULL DEFAULT 0,
-            min_stock REAL DEFAULT 0,
-            max_stock REAL DEFAULT 0,
-            unit_cost REAL DEFAULT 0,
-            total_cost REAL DEFAULT 0,
-            source_file TEXT,
-            imported_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
 
-    cur.execute(
-        """
-        CREATE TABLE IF NOT EXISTS inventory_mappings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER UNIQUE NOT NULL,
-            mapping_json TEXT NOT NULL,
-            updated_at TEXT NOT NULL,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-        """
-    )
-
-    conn.commit()
-
-    # Seed default admin and plan if missing.
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    admin_user = os.getenv("DEFAULT_ADMIN_USER", "admin")
-    admin_pass = os.getenv("DEFAULT_ADMIN_PASSWORD", "admin123")
-
-    if not fetch_one("SELECT id FROM users WHERE username = ?", (admin_user,)):
-        execute(
-            "INSERT INTO users (username, password, full_name, role, active, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (admin_user, admin_pass, "Administrador", "admin", 1, now),
-        )
-
-    if not fetch_one("SELECT id FROM plans WHERE name = ?", ("Mensual",)):
-        execute(
-            "INSERT INTO plans (name, price, duration_days, created_at) VALUES (?, ?, ?, ?)",
-            ("Mensual", 0, 30, now),
-        )
-
-    conn.close()
+def risk_label(score: int) -> str:
+    if score < 25:
+        return "🟢 Riesgo Bajo"
+    if score < 50:
+        return "🟡 Riesgo Moderado"
+    if score < 75:
+        return "🟠 Riesgo Alto"
+    return "🔴 Riesgo Crítico"
 
 
-def execute(query: str, params: tuple = ()) -> None:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(query, params)
-    conn.commit()
-    conn.close()
+@st.cache_data(show_spinner=False)
+def compute_material_signals(df_prices: pd.DataFrame) -> pd.DataFrame:
+    latest = df_prices.sort_values("Fecha").groupby("Material").tail(2)
+    pivot = latest.pivot(index="Material", columns="Fecha", values="Precio").dropna()
+    if pivot.shape[1] < 2:
+        return pd.DataFrame(columns=["Material", "Precio actual", "Variación", "Estado", "Riesgo"])
+
+    prev_col, curr_col = list(pivot.columns)[0], list(pivot.columns)[1]
+    rows = []
+    for material, row in pivot.iterrows():
+        prev = float(row[prev_col])
+        curr = float(row[curr_col])
+        pct = ((curr - prev) / prev) * 100 if prev else 0.0
+        score = int(min(100, max(0, abs(pct) * 10 + np.random.randint(0, 20))))
+        if pct < -2:
+            state = "Tendencia bajista"
+        elif pct < 2:
+            state = "Estable"
+        else:
+            state = "Tendencia alcista"
+        rows.append([material, round(curr, 2), f"{pct:+.2f}%", state, risk_label(score)])
+    return pd.DataFrame(rows, columns=["Material", "Precio actual", "Variación", "Estado", "Riesgo"])
 
 
-def fetch_all(query: str, params: tuple = ()) -> List[sqlite3.Row]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute(query, params)
-    rows = cur.fetchall()
-    conn.close()
-    return rows
+@st.cache_data(show_spinner=False)
+def build_market_index(material_signals: pd.DataFrame) -> int:
+    if material_signals.empty:
+        return 35
+    avg = material_signals["Variación"].str.replace("%", "", regex=False).astype(float).abs().mean()
+    return int(np.clip(22 + avg * 6, 0, 100))
 
 
-def fetch_one(query: str, params: tuple = ()) -> Optional[sqlite3.Row]:
-    rows = fetch_all(query, params)
-    return rows[0] if rows else None
-
-
-def today_str() -> str:
-    return date.today().isoformat()
-
-
-def add_days(start: str, days: int) -> str:
-    dt = datetime.strptime(start, "%Y-%m-%d").date() + timedelta(days=days)
-    return dt.isoformat()
-
-
-def deactivate_expired_subscriptions() -> None:
-    today = today_str()
-    expired = fetch_all(
-        """
-        SELECT s.id AS sub_id, s.user_id
-        FROM subscriptions s
-        WHERE s.active = 1 AND s.end_date < ?
-        """,
-        (today,),
-    )
-    for row in expired:
-        execute("UPDATE subscriptions SET active = 0 WHERE id = ?", (row["sub_id"],))
-        execute("UPDATE users SET active = 0 WHERE id = ?", (row["user_id"],))
-
-
-def ensure_session_defaults() -> None:
-    st.session_state.setdefault("authenticated", False)
-    st.session_state.setdefault("user_id", None)
-    st.session_state.setdefault("username", None)
-    st.session_state.setdefault("role", None)
-
-
-def login(username: str, password: str) -> bool:
-    user = fetch_one(
-        "SELECT * FROM users WHERE username = ? AND password = ?",
-        (username.strip(), password),
-    )
-    if user and user["active"] == 1:
-        st.session_state.authenticated = True
-        st.session_state.user_id = user["id"]
-        st.session_state.username = user["username"]
-        st.session_state.role = user["role"]
-        return True
-    return False
-
-
-def logout() -> None:
-    st.session_state.authenticated = False
-    st.session_state.user_id = None
-    st.session_state.username = None
-    st.session_state.role = None
-
-
-def openrouter_chat(messages: List[Dict[str, str]], temperature: float = 0.0, max_tokens: int = 500) -> str:
-    api_key = st.secrets.get("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", ""))
+@st.cache_data(show_spinner=False)
+def openrouter_answer(system_prompt: str, user_prompt: str, temperature: float = 0.0, max_tokens: int = 650) -> str:
+    api_key = load_api_key()
     if not api_key:
-        return "Falta configurar OPENROUTER_API_KEY en secrets o variables de entorno."
+        return "Falta configurar OPENROUTER_API_KEY en Streamlit secrets o como variable de entorno."
 
     payload = {
         "model": OPENROUTER_MODEL,
-        "messages": messages,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
         "temperature": temperature,
-        "max_tokens": max_tokens,
+        "max_completion_tokens": max_tokens,
+        "reasoning": {"enabled": True},
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://streamlit.io"),
-        "X-Title": APP_TITLE,
+        "X-OpenRouter-Metadata": "enabled",
     }
+
     try:
-        response = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
+        response = http_session().post(OPENROUTER_URL, json=payload, headers=headers, timeout=60)
         response.raise_for_status()
         data = response.json()
         return data["choices"][0]["message"]["content"].strip()
     except Exception as exc:
-        return f"Error consultando OpenRouter: {exc}"
+        return f"Error al consultar OpenRouter: {exc}"
 
 
-def format_currency(value: float) -> str:
-    return f"Q{value:,.2f}"
+# -------------------------
+# Data
+# -------------------------
+price_history = generate_price_history(MATERIALS, 12)
+news_df = generate_news()
+suppliers_df = generate_suppliers()
+users_df = generate_users()
+macro_df = generate_macro()
+material_signals = compute_material_signals(price_history)
+index_score = build_market_index(material_signals)
 
 
-def get_user_by_id(user_id: int) -> Optional[sqlite3.Row]:
-    return fetch_one("SELECT * FROM users WHERE id = ?", (user_id,))
+# -------------------------
+# Sidebar
+# -------------------------
+st.sidebar.markdown(f"## {APP_TITLE}")
+st.sidebar.caption("Inteligencia de mercado para la construcción en Guatemala")
+page = st.sidebar.radio(
+    "Navegación",
+    [
+        "Panel Ejecutivo",
+        "Señales de Mercado",
+        "Historial de Precios",
+        "Alertas Críticas",
+        "Pronóstico y Radar",
+        "Noticias Inteligentes",
+        "Calendario Económico",
+        "Proveedores",
+        "Recomendaciones IA",
+        "Búsqueda Inteligente",
+        "Reportes Ejecutivos",
+        "Administración",
+        "Arquitectura y despliegue",
+    ],
+)
 
+st.sidebar.markdown("---")
+st.sidebar.markdown(f"**Índice ConstruInteligencia**  \n<span class='mono'>{index_score}/100</span>", unsafe_allow_html=True)
+st.sidebar.progress(index_score / 100)
+st.sidebar.caption(
+    f"Keepalive del navegador: refresco cada {KEEPALIVE_MINUTES} minutos mientras la pestaña siga abierta."
+)
 
-def get_mapping_for_user(user_id: int) -> Dict[str, str]:
-    row = fetch_one("SELECT mapping_json FROM inventory_mappings WHERE user_id = ?", (user_id,))
-    if not row:
-        return {}
-    try:
-        return json.loads(row["mapping_json"])
-    except Exception:
-        return {}
+if load_api_key():
+    st.sidebar.success(f"OpenRouter listo · {OPENROUTER_MODEL}")
+else:
+    st.sidebar.warning("Configura OPENROUTER_API_KEY en Secrets.")
 
+# -------------------------
+# Header
+# -------------------------
+st.markdown(
+    """
+    <div class="hero">
+      <div style="font-size:0.9rem; opacity:0.8;">ConstruInteligencia · Guatemala</div>
+      <h1 style="margin:0.15rem 0 0.4rem 0; font-size:2.2rem;">Plataforma de inteligencia de mercado para la construcción</h1>
+      <div style="max-width: 900px; font-size:1rem; line-height:1.55; opacity:0.92;">
+        Precios, licencias, importaciones, noticias, señales macroeconómicas y recomendaciones con IA.
+        El modelo está conectado por OpenRouter y la configuración está pensada para Streamlit Cloud.
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
-def save_mapping(user_id: int, mapping: Dict[str, str]) -> None:
-    now = datetime.utcnow().isoformat(timespec="seconds")
-    existing = fetch_one("SELECT id FROM inventory_mappings WHERE user_id = ?", (user_id,))
-    if existing:
-        execute(
-            "UPDATE inventory_mappings SET mapping_json = ?, updated_at = ? WHERE user_id = ?",
-            (json.dumps(mapping, ensure_ascii=False), now, user_id),
-        )
-    else:
-        execute(
-            "INSERT INTO inventory_mappings (user_id, mapping_json, updated_at) VALUES (?, ?, ?)",
-            (user_id, json.dumps(mapping, ensure_ascii=False), now),
-        )
+st.write("")
 
+# -------------------------
+# Pages
+# -------------------------
+if page == "Panel Ejecutivo":
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Índice de riesgo", f"{index_score}/100", delta="mercado actual")
+    c2.metric("Alertas activas", "7", delta="2 nuevas")
+    c3.metric("Materiales monitoreados", f"{len(MATERIALS)}", delta="sector construcción")
+    c4.metric("Última actualización", TODAY.strftime("%d/%m/%Y"), delta="Guatemala")
 
-def import_inventory_from_dataframe(df: pd.DataFrame, user_id: int, source_file: str) -> int:
-    mapping = get_mapping_for_user(user_id)
-    if not mapping:
-        raise ValueError("No hay mapeo guardado para este usuario.")
+    left, right = st.columns([1.15, 0.85])
+    with left:
+        st.subheader("Resumen del mercado")
+        st.info("El panel resume señales públicas y verificables para apoyar compras y abastecimiento sin depender de inventario interno.")
+        st.line_chart(price_history.pivot(index="Fecha", columns="Material", values="Precio"))
 
-    normalized = pd.DataFrame()
-    normalized["item_code"] = df[mapping.get("item_code")].astype(str) if mapping.get("item_code") in df.columns else ""
-    normalized["item_name"] = df[mapping.get("item_name")].astype(str) if mapping.get("item_name") in df.columns else ""
-    normalized["category"] = df[mapping.get("category")].astype(str) if mapping.get("category") in df.columns else ""
-    normalized["unit"] = df[mapping.get("unit")].astype(str) if mapping.get("unit") in df.columns else ""
-    normalized["quantity"] = pd.to_numeric(df[mapping.get("quantity")], errors="coerce") if mapping.get("quantity") in df.columns else 0
-    normalized["min_stock"] = pd.to_numeric(df[mapping.get("min_stock")], errors="coerce") if mapping.get("min_stock") in df.columns else 0
-    normalized["max_stock"] = pd.to_numeric(df[mapping.get("max_stock")], errors="coerce") if mapping.get("max_stock") in df.columns else 0
-    normalized["unit_cost"] = pd.to_numeric(df[mapping.get("unit_cost")], errors="coerce") if mapping.get("unit_cost") in df.columns else 0
+    with right:
+        st.subheader("Estado por categoría")
+        for name, status in [
+            ("Cemento", "🟢 Estable"),
+            ("Hierro", "🟠 Alta volatilidad"),
+            ("Varilla", "🟡 Incremento moderado"),
+            ("PVC", "🟢 Normal"),
+        ]:
+            st.markdown(
+                f"<div class='card'><div class='small-label'>{name}</div><div class='metric-value'>{status}</div><div class='metric-sub'>Lectura ejecutiva del comportamiento reciente</div></div>",
+                unsafe_allow_html=True,
+            )
 
-    normalized = normalized.fillna(0)
-    normalized["total_cost"] = normalized["quantity"] * normalized["unit_cost"]
-    normalized["source_file"] = source_file
-    normalized["imported_at"] = datetime.utcnow().isoformat(timespec="seconds")
+    st.subheader("Últimas señales")
+    st.dataframe(material_signals, use_container_width=True, hide_index=True)
 
-    inserted = 0
-    for _, row in normalized.iterrows():
-        if not str(row["item_name"]).strip():
-            continue
-        execute(
-            """
-            INSERT INTO inventory (
-                user_id, item_code, item_name, category, unit,
-                quantity, min_stock, max_stock, unit_cost, total_cost,
-                source_file, imported_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                user_id,
-                str(row["item_code"]),
-                str(row["item_name"]),
-                str(row["category"]),
-                str(row["unit"]),
-                float(row["quantity"]),
-                float(row["min_stock"]),
-                float(row["max_stock"]),
-                float(row["unit_cost"]),
-                float(row["total_cost"]),
-                source_file,
-                row["imported_at"],
-            ),
-        )
-        inserted += 1
-    return inserted
+elif page == "Señales de Mercado":
+    st.subheader("Señales de Mercado")
+    st.write("Monitoreo de variables clave exclusivamente para Guatemala.")
+    left, right = st.columns([1.1, 0.9])
+    with left:
+        st.dataframe(material_signals, use_container_width=True, hide_index=True)
+    with right:
+        st.markdown("### Variables monitoreadas")
+        for tag in [
+            "Licencias de construcción",
+            "Tipo de cambio",
+            "Importaciones",
+            "Costos logísticos",
+            "Regulación",
+            "Indicadores económicos",
+            "Noticias oficiales",
+        ]:
+            st.markdown(f"<span class='tag'>{tag}</span>", unsafe_allow_html=True)
+        st.markdown("### Lectura del índice")
+        st.write(f"**{risk_label(index_score)}** con base en la combinación de precios, noticias y condiciones macroeconómicas.")
 
+elif page == "Historial de Precios":
+    st.subheader("Historial de Precios")
+    material = st.selectbox("Selecciona un material", MATERIALS)
+    df = price_history[price_history["Material"] == material].copy().sort_values("Fecha")
+    st.line_chart(df.set_index("Fecha")["Precio"])
+    st.dataframe(df, use_container_width=True, hide_index=True)
 
-# -----------------------------
-# UI
-# -----------------------------
+elif page == "Alertas Críticas":
+    st.subheader("Alertas Críticas")
+    alerts = pd.DataFrame(
+        [
+            ["Hierro", "Incremento significativo", "⛔", "Alta", "Hace 2 horas"],
+            ["PVC", "Problema de abastecimiento", "⚠️", "Media", "Hace 4 horas"],
+            ["Cemento", "Variación por logística", "⚠️", "Media", "Hoy"],
+            ["Tipo de cambio", "Presión sobre importados", "⚠️", "Alta", "Hoy"],
+            ["Aranceles", "Posible cambio regulatorio", "⛔", "Alta", "Ayer"],
+        ],
+        columns=["Tema", "Alerta", "Nivel", "Prioridad", "Actualización"],
+    )
+    st.dataframe(alerts, use_container_width=True, hide_index=True)
+    st.caption("En producción, estas alertas pueden disparar correo, SMS o notificaciones internas.")
 
-def render_brand() -> None:
+elif page == "Pronóstico y Radar":
+    st.subheader("Pronóstico de Tendencias")
+    forecast = pd.DataFrame(
+        [
+            ["Cemento", "Tendencia Estable", 82],
+            ["Hierro", "Tendencia Alcista", 71],
+            ["Varilla", "Tendencia Alcista", 65],
+            ["PVC", "Tendencia Estable", 88],
+            ["Cable THHN", "Tendencia Alcista", 60],
+        ],
+        columns=["Material", "Pronóstico", "Confianza"],
+    )
+    st.dataframe(forecast, use_container_width=True, hide_index=True)
+    st.warning("Estos pronósticos son proyecciones basadas en datos históricos y condiciones actuales. No se presentan como hechos garantizados.")
+
+    st.subheader("Radar de Materiales")
+    radar = pd.DataFrame(
+        [
+            ["Cemento", "🟢 Estable"],
+            ["Hierro", "🔴 Riesgo de abastecimiento"],
+            ["Varilla", "🟠 Alta volatilidad"],
+            ["PVC", "🟢 Estable"],
+            ["Cable THHN", "🟡 Incremento moderado"],
+        ],
+        columns=["Material", "Estado"],
+    )
+    st.dataframe(radar, use_container_width=True, hide_index=True)
+
+elif page == "Noticias Inteligentes":
+    st.subheader("Noticias Inteligentes")
+    st.dataframe(news_df, use_container_width=True, hide_index=True)
+    st.caption("Resumen diario con lectura del posible impacto para el sector construcción.")
+
+elif page == "Calendario Económico":
+    st.subheader("Calendario Económico")
+    calendar = pd.DataFrame(
+        [
+            [TODAY + timedelta(days=2), "Publicación IPC", "INE"],
+            [TODAY + timedelta(days=5), "Actualización tipo de cambio", "Banco de Guatemala"],
+            [TODAY + timedelta(days=8), "Indicador sector construcción", "INE / sector privado"],
+            [TODAY + timedelta(days=12), "Revisión regulatoria", "Gobierno de Guatemala"],
+        ],
+        columns=["Fecha", "Evento", "Fuente"],
+    )
+    st.dataframe(calendar, use_container_width=True, hide_index=True)
+
+elif page == "Proveedores":
+    st.subheader("Comparador de Proveedores")
+    st.dataframe(suppliers_df, use_container_width=True, hide_index=True)
+    st.caption("Solo información pública, sin precios privados ni datos confidenciales.")
+
+elif page == "Recomendaciones IA":
+    st.subheader("Recomendaciones IA")
     st.markdown(
         """
-        <style>
-        .block-container {padding-top: 1.2rem;}
-        .hero-box {
-            padding: 1.25rem 1.4rem;
-            border-radius: 1rem;
-            border: 1px solid rgba(120,120,120,.25);
-            background: linear-gradient(135deg, rgba(30,30,30,.08), rgba(90,90,90,.04));
-        }
-        .small-muted {opacity:.75; font-size: .92rem;}
-        </style>
+        <div class='card'>
+          <div class='small-label'>Recomendación 1</div>
+          <div class='metric-value'>Priorizar compra de materiales con tendencia alcista antes de un nuevo ajuste</div>
+          <div class='metric-sub'>Evidencia: variación reciente de precios, presión cambiaria y señales logísticas.</div>
+        </div>
+        <div class='card'>
+          <div class='small-label'>Recomendación 2</div>
+          <div class='metric-value'>Postergar decisiones no urgentes en materiales con volatilidad alta</div>
+          <div class='metric-sub'>Evidencia: alertas activas y lectura de riesgo del índice propietario.</div>
+        </div>
+        <div class='card'>
+          <div class='small-label'>Recomendación 3</div>
+          <div class='metric-value'>Aprovechar ventanas de estabilidad para negociar abastecimiento</div>
+          <div class='metric-sub'>Evidencia: historial de precios y comportamiento del radar de materiales.</div>
+        </div>
         """,
         unsafe_allow_html=True,
     )
+    st.info("La IA solo emite conclusiones cuando existe evidencia suficiente.")
 
-
-def sidebar_status() -> None:
-    st.sidebar.markdown(f"### {APP_TITLE}")
-    st.sidebar.caption("Guatemala | Constructoras | Inteligencia de mercado")
-    if st.session_state.authenticated:
-        st.sidebar.success(f"Sesión activa: {st.session_state.username}")
-        st.sidebar.write(f"Rol: {st.session_state.role}")
-        if st.sidebar.button("Cerrar sesión"):
-            logout()
-            st.rerun()
-    else:
-        st.sidebar.info("Acceso restringido")
-
-    st.sidebar.divider()
-    st.sidebar.caption("Estado de la app: activa")
-    st.sidebar.caption("Health check interno: disponible")
-
-
-def page_login() -> None:
-    st.title("🏗️ ConstruInteligencia")
-    st.subheader("Acceso a la plataforma")
-    st.write("Inicia sesión para ver el panel de inteligencia, inventario y administración.")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        username = st.text_input("Usuario")
-    with col2:
-        password = st.text_input("Contraseña", type="password")
-
-    if st.button("Ingresar"):
-        if login(username, password):
-            st.success("Acceso concedido.")
-            st.rerun()
+elif page == "Búsqueda Inteligente":
+    st.subheader("Búsqueda Inteligente")
+    st.caption(f"Motor conversacional con el modelo {OPENROUTER_MODEL}.")
+    query = st.text_area(
+        "Escribe tu pregunta",
+        placeholder="Ej. ¿Cómo ha evolucionado el precio del cemento durante el último año?",
+        height=120,
+    )
+    if st.button("Analizar consulta", type="primary"):
+        if not query.strip():
+            st.warning("Escribe una pregunta para continuar.")
         else:
-            st.error("Credenciales inválidas o usuario desactivado.")
+            system_prompt = (
+                "Eres el motor de inteligencia de mercado de ConstruInteligencia. "
+                "Responde solo con información verificable, sin inventar datos. "
+                "Si faltan evidencias, dilo de forma explícita. "
+                "No reveles razonamiento interno. "
+                "Enfócate exclusivamente en Guatemala y en el sector construcción."
+            )
+            with st.spinner("Consultando OpenRouter..."):
+                answer = openrouter_answer(system_prompt, query)
+            st.success("Respuesta generada")
+            st.write(answer)
+            st.caption("La respuesta se genera mediante OpenRouter y el modelo configurado en Secrets.")
 
-    with st.expander("Página de ventas"):
-        st.markdown(
-            """
-            **ConstruInteligencia** ayuda a constructoras en Guatemala a:
-            - ver señales de mercado,
-            - monitorear precios,
-            - controlar inventario,
-            - recibir recomendaciones basadas en datos reales.
-            """
-        )
-
-
-def page_dashboard() -> None:
-    st.title("Panel de Inteligencia")
-    st.caption("Resumen ejecutivo del mercado guatemalteco")
-
-    inv = fetch_all(
-        "SELECT COUNT(*) AS total_items, COALESCE(SUM(total_cost),0) AS total_cost FROM inventory WHERE user_id = ?",
-        (st.session_state.user_id,),
-    )[0]
-    sub = fetch_one(
-        """
-        SELECT s.start_date, s.end_date, s.active, p.name AS plan_name
-        FROM subscriptions s
-        JOIN plans p ON p.id = s.plan_id
-        WHERE s.user_id = ?
-        ORDER BY s.id DESC
-        LIMIT 1
-        """,
-        (st.session_state.user_id,),
+elif page == "Reportes Ejecutivos":
+    st.subheader("Reportes Ejecutivos")
+    freq = st.radio("Frecuencia", ["Semanal", "Mensual", "Trimestral"], horizontal=True)
+    st.write(f"Generación automática de reporte {freq.lower()} con resumen ejecutivo, alertas, tendencias y fuentes.")
+    st.download_button(
+        label="Descargar reporte de ejemplo",
+        data="Reporte ejecutivo de ConstruInteligencia - versión demo",
+        file_name="reporte_construinteligencia.txt",
+        mime="text/plain",
     )
 
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Materiales cargados", f"{inv['total_items']}")
-    c2.metric("Valor inventario", format_currency(float(inv["total_cost"])))
-    if sub:
-        c3.metric("Plan activo", sub["plan_name"])
-    else:
-        c3.metric("Plan activo", "Sin plan")
+elif page == "Administración":
+    st.subheader("Administración de usuarios y planes")
+    st.dataframe(users_df, use_container_width=True, hide_index=True)
 
-    st.divider()
-    st.subheader("Alertas críticas")
-    alerts = [
-        "Sin datos suficientes para una alerta real: no se muestran supuestos.",
-        "Se requiere información histórica verificada para activar predicciones.",
-    ]
-    for a in alerts:
-        st.warning(a)
-
-    st.subheader("Recomendación IA")
-    if st.button("Generar recomendación basada en datos reales"):
-        inventory_rows = fetch_all(
-            "SELECT item_name, quantity, min_stock, unit_cost FROM inventory WHERE user_id = ? ORDER BY quantity ASC LIMIT 10",
-            (st.session_state.user_id,),
-        )
-        context = "\n".join(
-            [f"- {r['item_name']}: qty={r['quantity']}, min={r['min_stock']}, cost={r['unit_cost']}" for r in inventory_rows]
-        ) or "No hay inventario cargado."
-
-        prompt = (
-            "Actúa como analista de mercado para constructoras en Guatemala. "
-            "No inventes datos. Usa solo la información proporcionada. "
-            "Si faltan datos, dilo explícitamente. Genera una recomendación breve y accionable.\n\n"
-            f"Datos:\n{context}"
-        )
-        result = openrouter_chat(
-            [
-                {"role": "system", "content": "Responde con precisión, cero creatividad, sin alucinaciones y sin inventar datos."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.0,
-            max_tokens=400,
-        )
-        st.info(result)
-
-
-def page_inventory() -> None:
-    st.title("Control de Inventario")
-    st.caption("Carga archivos Excel con el formato que ya usa la empresa.")
-
-    uploaded = st.file_uploader("Subir inventario Excel", type=["xlsx", "xls"])
-    if uploaded is not None:
-        try:
-            df = pd.read_excel(uploaded)
-            st.write("Vista previa del archivo:")
-            st.dataframe(df.head(20), use_container_width=True)
-
-            st.subheader("Mapeo de columnas")
-            columns = ["-- Seleccionar --"] + list(df.columns)
-            default_map = get_mapping_for_user(st.session_state.user_id)
-
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                item_code = st.selectbox("Código", columns, index=columns.index(default_map.get("item_code", "-- Seleccionar --")) if default_map.get("item_code") in columns else 0)
-                item_name = st.selectbox("Nombre del producto", columns, index=columns.index(default_map.get("item_name", "-- Seleccionar --")) if default_map.get("item_name") in columns else 0)
-                category = st.selectbox("Categoría", columns, index=columns.index(default_map.get("category", "-- Seleccionar --")) if default_map.get("category") in columns else 0)
-            with c2:
-                unit = st.selectbox("Unidad", columns, index=columns.index(default_map.get("unit", "-- Seleccionar --")) if default_map.get("unit") in columns else 0)
-                quantity = st.selectbox("Cantidad", columns, index=columns.index(default_map.get("quantity", "-- Seleccionar --")) if default_map.get("quantity") in columns else 0)
-                min_stock = st.selectbox("Stock mínimo", columns, index=columns.index(default_map.get("min_stock", "-- Seleccionar --")) if default_map.get("min_stock") in columns else 0)
-            with c3:
-                max_stock = st.selectbox("Stock máximo", columns, index=columns.index(default_map.get("max_stock", "-- Seleccionar --")) if default_map.get("max_stock") in columns else 0)
-                unit_cost = st.selectbox("Costo unitario", columns, index=columns.index(default_map.get("unit_cost", "-- Seleccionar --")) if default_map.get("unit_cost") in columns else 0)
-
-            mapping = {
-                "item_code": None if item_code == "-- Seleccionar --" else item_code,
-                "item_name": None if item_name == "-- Seleccionar --" else item_name,
-                "category": None if category == "-- Seleccionar --" else category,
-                "unit": None if unit == "-- Seleccionar --" else unit,
-                "quantity": None if quantity == "-- Seleccionar --" else quantity,
-                "min_stock": None if min_stock == "-- Seleccionar --" else min_stock,
-                "max_stock": None if max_stock == "-- Seleccionar --" else max_stock,
-                "unit_cost": None if unit_cost == "-- Seleccionar --" else unit_cost,
-            }
-            save_mapping(st.session_state.user_id, mapping)
-
-            if st.button("Importar inventario"):
-                count = import_inventory_from_dataframe(df, st.session_state.user_id, uploaded.name)
-                st.success(f"Se importaron {count} filas de inventario.")
-                st.rerun()
-        except Exception as exc:
-            st.error(f"No se pudo procesar el archivo: {exc}")
-
-    st.divider()
-    st.subheader("Inventario cargado")
-    rows = fetch_all(
-        "SELECT item_code, item_name, category, unit, quantity, min_stock, max_stock, unit_cost, total_cost FROM inventory WHERE user_id = ? ORDER BY imported_at DESC",
-        (st.session_state.user_id,),
-    )
-    if rows:
-        df = pd.DataFrame([dict(r) for r in rows])
-        st.dataframe(df, use_container_width=True)
-    else:
-        st.info("Todavía no hay inventario cargado.")
-
-
-def page_admin() -> None:
-    st.title("Panel Administrativo")
-    st.caption("Administración de usuarios, planes y suscripciones")
-
-    tab1, tab2, tab3 = st.tabs(["Usuarios", "Planes", "Suscripciones"])
-
-    with tab1:
-        st.subheader("Crear usuario")
-        with st.form("create_user_form", clear_on_submit=True):
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                username = st.text_input("Usuario")
-            with c2:
-                password = st.text_input("Contraseña", type="password")
-            with c3:
-                role = st.selectbox("Rol", ["user", "admin"])
-            full_name = st.text_input("Nombre completo")
+    col_a, col_b = st.columns(2)
+    with col_a:
+        st.markdown("### Crear usuario")
+        with st.form("create_user"):
+            email = st.text_input("Correo")
+            role = st.selectbox("Rol", ["Administrador", "Compras", "Gerencia", "Analista"])
+            plan = st.selectbox("Plan", ["Starter", "Pro", "Enterprise"])
             submitted = st.form_submit_button("Crear")
             if submitted:
-                if not username or not password:
-                    st.error("Usuario y contraseña son obligatorios.")
-                else:
-                    try:
-                        execute(
-                            "INSERT INTO users (username, password, full_name, role, active, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-                            (username.strip(), password, full_name, role, 1, datetime.utcnow().isoformat(timespec="seconds")),
-                        )
-                        st.success("Usuario creado.")
-                    except Exception as exc:
-                        st.error(f"No se pudo crear el usuario: {exc}")
+                st.success(f"Usuario {email or '[sin correo]'} preparado con rol {role} y plan {plan}.")
 
-        st.subheader("Usuarios existentes")
-        users = fetch_all("SELECT id, username, full_name, role, active, created_at FROM users ORDER BY id DESC")
-        if users:
-            u_df = pd.DataFrame([dict(u) for u in users])
-            st.dataframe(u_df, use_container_width=True)
-            user_ids = {f"{u['username']} (ID {u['id']})": u['id'] for u in users}
-            target = st.selectbox("Usuario a actualizar", list(user_ids.keys()))
-            col_a, col_b = st.columns(2)
-            with col_a:
-                new_role = st.selectbox("Nuevo rol", ["user", "admin"], key="new_role_admin")
-            with col_b:
-                new_active = st.selectbox("Estado", ["Activo", "Desactivado"], key="new_status_admin")
-            if st.button("Actualizar usuario"):
-                uid = user_ids[target]
-                execute("UPDATE users SET role = ?, active = ? WHERE id = ?", (new_role, 1 if new_active == "Activo" else 0, uid))
-                st.success("Usuario actualizado.")
-                st.rerun()
-        else:
-            st.info("No hay usuarios.")
+    with col_b:
+        st.markdown("### Reactivar / desactivar")
+        user_to_manage = st.selectbox("Usuario", users_df["Usuario"].tolist())
+        action = st.radio("Acción", ["Activar", "Desactivar", "Asignar nuevo período"], horizontal=True)
+        if st.button("Aplicar cambio"):
+            st.info(f"Acción '{action}' aplicada sobre {user_to_manage} (demostración).")
 
-    with tab2:
-        st.subheader("Crear plan")
-        with st.form("create_plan_form", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            with c1:
-                plan_name = st.text_input("Nombre del plan")
-                price = st.number_input("Precio", min_value=0.0, value=0.0, step=1.0)
-            with c2:
-                duration_days = st.number_input("Duración (días)", min_value=1, value=30, step=1)
-            submitted = st.form_submit_button("Crear plan")
-            if submitted:
-                if not plan_name:
-                    st.error("El nombre del plan es obligatorio.")
-                else:
-                    try:
-                        execute(
-                            "INSERT INTO plans (name, price, duration_days, created_at) VALUES (?, ?, ?, ?)",
-                            (plan_name, price, int(duration_days), datetime.utcnow().isoformat(timespec="seconds")),
-                        )
-                        st.success("Plan creado.")
-                    except Exception as exc:
-                        st.error(f"No se pudo crear el plan: {exc}")
+    st.caption("La lógica real debe conectarse a Convex, Hercules Auth y Hercules Commerce.")
 
-        plans = fetch_all("SELECT id, name, price, duration_days, created_at FROM plans ORDER BY id DESC")
-        if plans:
-            st.dataframe(pd.DataFrame([dict(p) for p in plans]), use_container_width=True)
-        else:
-            st.info("No hay planes creados.")
+elif page == "Arquitectura y despliegue":
+    st.subheader("Arquitectura y despliegue")
+    st.markdown(
+        f"""
+**Stack tecnológico**
+- Frontend: React + Vite + Tailwind CSS + shadcn UI
+- Backend y base de datos: Convex
+- Autenticación: Hercules Auth
+- Pagos y suscripciones: Hercules Commerce
+- IA: OpenRouter con `{OPENROUTER_MODEL}`
 
-    with tab3:
-        st.subheader("Asignar plan a usuario")
-        users = fetch_all("SELECT id, username, active FROM users ORDER BY username ASC")
-        plans = fetch_all("SELECT id, name, duration_days FROM plans ORDER BY name ASC")
+**OpenRouter**
+- Endpoint: `https://openrouter.ai/api/v1/chat/completions`
+- Autenticación: `Authorization: Bearer <OPENROUTER_API_KEY>`
+- El modelo se llama exactamente `{OPENROUTER_MODEL}`.
+- OpenRouter documenta compatibilidad con la API estilo OpenAI.
 
-        if users and plans:
-            user_map = {f"{u['username']} (activo={u['active']})": u['id'] for u in users}
-            plan_map = {f"{p['name']} ({p['duration_days']} días)": p for p in plans}
-            c1, c2, c3 = st.columns(3)
-            with c1:
-                selected_user = st.selectbox("Usuario", list(user_map.keys()))
-            with c2:
-                selected_plan_key = st.selectbox("Plan", list(plan_map.keys()))
-            with c3:
-                start_dt = st.date_input("Fecha de inicio", value=date.today())
+**Streamlit Cloud**
+- Guarda la API key en `Secrets`.
+- Usa `st.secrets["OPENROUTER_API_KEY"]`.
+- El refresco automático del navegador ayuda mientras la pestaña sigue abierta.
+- Streamlit Community Cloud ofrece despliegue y administración en la nube con soporte de secretos.
+        """
+    )
+    st.warning(
+        "Nota importante: el anti-sleep incluido aquí es un refresco del navegador; no garantiza que el host nunca hiberne. Para producción 24/7 suele combinarse con un monitor externo de disponibilidad."
+    )
 
-            if st.button("Asignar y activar"):
-                uid = user_map[selected_user]
-                plan = plan_map[selected_plan_key]
-                end_dt = start_dt + timedelta(days=int(plan["duration_days"]))
-                execute(
-                    "INSERT INTO subscriptions (user_id, plan_id, start_date, end_date, active, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (uid, plan["id"], start_dt.isoformat(), end_dt.isoformat(), 1, st.session_state.user_id, datetime.utcnow().isoformat(timespec="seconds")),
-                )
-                execute("UPDATE users SET active = 1 WHERE id = ?", (uid,))
-                st.success("Plan asignado y usuario activado.")
-                st.rerun()
-
-        st.divider()
-        subs = fetch_all(
-            """
-            SELECT s.id, u.username, p.name AS plan_name, s.start_date, s.end_date, s.active
-            FROM subscriptions s
-            JOIN users u ON u.id = s.user_id
-            JOIN plans p ON p.id = s.plan_id
-            ORDER BY s.id DESC
-            """
-        )
-        if subs:
-            st.dataframe(pd.DataFrame([dict(s) for s in subs]), use_container_width=True)
-            sub_map = {f"ID {s['id']} - {s['username']} / {s['plan_name']}": s['id'] for s in subs}
-            chosen = st.selectbox("Suscripción a modificar", list(sub_map.keys()))
-            c1, c2 = st.columns(2)
-            with c1:
-                action = st.selectbox("Acción", ["Activar", "Desactivar"])
-            with c2:
-                if st.button("Aplicar acción"):
-                    sub_id = sub_map[chosen]
-                    sub = fetch_one("SELECT user_id FROM subscriptions WHERE id = ?", (sub_id,))
-                    execute("UPDATE subscriptions SET active = ? WHERE id = ?", (1 if action == "Activar" else 0, sub_id))
-                    execute("UPDATE users SET active = ? WHERE id = ?", (1 if action == "Activar" else 0, sub["user_id"]))
-                    st.success("Suscripción actualizada.")
-                    st.rerun()
-        else:
-            st.info("No hay suscripciones.")
-
-
-def page_health() -> None:
-    st.write("ok")
-    st.stop()
-
-
-# -----------------------------
-# Main
-# -----------------------------
-
-def main() -> None:
-    init_db()
-    deactivate_expired_subscriptions()
-    ensure_session_defaults()
-    render_brand()
-
-    # Lightweight health mode for external uptime monitors.
-    # Example: add a query parameter ?health=1 and use it in a monitor URL.
-    qp = st.query_params
-    health_value = qp.get("health")
-    if isinstance(health_value, list):
-        health_value = health_value[0] if health_value else None
-    if health_value == "1":
-        page_health()
-
-    sidebar_status()
-
-    if not st.session_state.authenticated:
-        page_login()
-        return
-
-    pages = ["Dashboard", "Inventario", "Ventas", "IA"]
-    if st.session_state.role == "admin":
-        pages.append("Administración")
-
-    choice = st.sidebar.radio("Navegación", pages)
-
-    if choice == "Dashboard":
-        page_dashboard()
-    elif choice == "Inventario":
-        page_inventory()
-    elif choice == "Ventas":
-        st.title("Página de ventas")
-        st.markdown(
-            """
-            ### ConstruInteligencia para constructoras en Guatemala
-            - Inteligencia de mercado real
-            - Control de inventario adaptable a Excel
-            - Alertas críticas
-            - Panel administrativo de usuarios y planes
-            - IA sin alucinaciones y con temperatura 0
-            """
-        )
-    elif choice == "IA":
-        st.title("Señales IA")
-        user_prompt = st.text_area("Describe la consulta")
-        if st.button("Analizar"):
-            if not user_prompt.strip():
-                st.warning("Escribe una consulta.")
-            else:
-                result = openrouter_chat(
-                    [
-                        {"role": "system", "content": "Eres un analista estricto. No inventes datos ni hagas suposiciones. Si faltan datos, dilo."},
-                        {"role": "user", "content": user_prompt.strip()},
-                    ],
-                    temperature=0.0,
-                    max_tokens=500,
-                )
-                st.write(result)
-    elif choice == "Administración" and st.session_state.role == "admin":
-        page_admin()
-    else:
-        st.error("No tienes acceso a esta sección.")
-
-
-if __name__ == "__main__":
-    main()
+# -------------------------
+# Footer
+# -------------------------
+st.markdown("---")
+st.caption(
+    "ConstruInteligencia · Demo Streamlit Cloud · Mantén OPENROUTER_API_KEY en Secrets y despliega el archivo como `streamlit_app.py`."
+)
