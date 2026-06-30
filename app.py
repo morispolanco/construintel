@@ -8,27 +8,18 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 # ============================================================
-# ConstruInteligencia · Streamlit Cloud ready
-# - Uses OpenRouter model:
-#   nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free
-# - API key must be stored in Streamlit secrets:
+# Constru-IA · Streamlit Cloud ready
+# - IA via OpenRouter
+# - API key in Streamlit secrets:
 #   OPENROUTER_API_KEY = "..."
+# - Optional model override in secrets/env:
+#   OPENROUTER_MODEL = "..."
 # ============================================================
 
-st.set_page_config(
-    page_title="ConstruInteligencia",
-    page_icon="🏗️",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-
-# -------------------------
-# Config
-# -------------------------
-OPENROUTER_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
+APP_TITLE = "Constru-IA"
+DEFAULT_MODEL = "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
-APP_TITLE = "ConstruInteligencia"
-KEEPALIVE_MINUTES = 9  # browser-side refresh while tab remains open
+KEEPALIVE_MINUTES = 9
 
 MATERIALS = [
     "Cemento",
@@ -43,26 +34,41 @@ MATERIALS = [
     "Acero estructural",
 ]
 
-SOURCE_SET = [
-    "Banco de Guatemala",
-    "Instituto Nacional de Estadística",
-    "SAT",
-    "Ministerio de Economía",
-    "Ministerio de Comunicaciones",
-    "Cámara Guatemalteca de la Construcción",
-    "Diario de Centro América",
-    "Medios económicos especializados",
-]
-
 TODAY = date.today()
 np.random.seed(7)
 
 
 # -------------------------
-# Anti-sleep / keep-alive
+# Page setup
 # -------------------------
-# This helps keep an active browser tab refreshing periodically.
-# It cannot guarantee that a cloud host will never hibernate the backend.
+st.set_page_config(
+    page_title=APP_TITLE,
+    page_icon="🏗️",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+
+# -------------------------
+# Simple auth state
+# -------------------------
+def init_session_state() -> None:
+    if "logged_in" not in st.session_state:
+        st.session_state.logged_in = False
+    if "usuario" not in st.session_state:
+        st.session_state.usuario = ""
+    if "rol" not in st.session_state:
+        st.session_state.rol = ""
+
+
+init_session_state()
+
+
+# -------------------------
+# Keepalive / anti-sleep
+# -------------------------
+# Helps while the browser tab remains open.
+# It cannot guarantee that Streamlit Cloud will never hibernate the backend.
 components.html(
     f"""
     <script>
@@ -143,6 +149,16 @@ st.markdown(
         margin-bottom: 0.35rem;
       }
 
+      .login-box {
+        max-width: 520px;
+        margin: 7vh auto;
+        padding: 2rem;
+        border-radius: 1.4rem;
+        border: 1px solid rgba(148,163,184,0.22);
+        background: rgba(255,255,255,0.72);
+        box-shadow: 0 20px 40px rgba(0,0,0,0.08);
+      }
+
       .muted-note {
         color: #64748b;
         font-size: 0.88rem;
@@ -156,24 +172,31 @@ st.markdown(
 # -------------------------
 # Helpers
 # -------------------------
-
 def load_api_key() -> str:
-    """Prefer Streamlit secrets, then environment variable."""
     try:
         return st.secrets["OPENROUTER_API_KEY"]
     except Exception:
         return os.getenv("OPENROUTER_API_KEY", "")
 
 
+def load_model() -> str:
+    try:
+        return st.secrets.get("OPENROUTER_MODEL", DEFAULT_MODEL)
+    except Exception:
+        return os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+
+
 @st.cache_resource(show_spinner=False)
 def http_session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update({
-        "HTTP-Referer": "https://streamlit.io",
-        "X-Title": APP_TITLE,
-        "Content-Type": "application/json",
-    })
-    return s
+    session = requests.Session()
+    session.headers.update(
+        {
+            "HTTP-Referer": "https://streamlit.io",
+            "X-Title": APP_TITLE,
+            "Content-Type": "application/json",
+        }
+    )
+    return session
 
 
 @st.cache_data(show_spinner=False)
@@ -286,11 +309,13 @@ def build_market_index(material_signals: pd.DataFrame) -> int:
 @st.cache_data(show_spinner=False)
 def openrouter_answer(system_prompt: str, user_prompt: str, temperature: float = 0.0, max_tokens: int = 650) -> str:
     api_key = load_api_key()
+    model = load_model()
+
     if not api_key:
         return "Falta configurar OPENROUTER_API_KEY en Streamlit secrets o como variable de entorno."
 
     payload = {
-        "model": OPENROUTER_MODEL,
+        "model": model,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -301,7 +326,7 @@ def openrouter_answer(system_prompt: str, user_prompt: str, temperature: float =
     }
     headers = {
         "Authorization": f"Bearer {api_key}",
-        "X-OpenRouter-Metadata": "enabled",
+        "X-Title": APP_TITLE,
     }
 
     try:
@@ -311,6 +336,52 @@ def openrouter_answer(system_prompt: str, user_prompt: str, temperature: float =
         return data["choices"][0]["message"]["content"].strip()
     except Exception as exc:
         return f"Error al consultar OpenRouter: {exc}"
+
+
+# -------------------------
+# Auth screen
+# -------------------------
+def login_screen() -> None:
+    st.markdown(
+        """
+        <div class="login-box">
+          <h1 style="margin-top:0;">Constru-IA</h1>
+          <p style="margin-top:-0.25rem; color:#475569;">
+            Plataforma de inteligencia de mercado para la construcción en Guatemala.
+          </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    with st.container():
+        st.markdown("<div class='login-box'>", unsafe_allow_html=True)
+        st.subheader("Iniciar sesión")
+        usuario = st.text_input("Usuario", placeholder="admin@demo.gt")
+        password = st.text_input("Contraseña", type="password", placeholder="••••••••")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Entrar", type="primary", use_container_width=True):
+                # Demo local. Sustituir por Hercules Auth en producción.
+                if usuario.strip() and password.strip():
+                    st.session_state.logged_in = True
+                    st.session_state.usuario = usuario.strip()
+                    st.session_state.rol = "Administrador" if usuario.startswith("admin") else "Usuario"
+                    st.rerun()
+                else:
+                    st.error("Ingresa usuario y contraseña.")
+        with c2:
+            st.button("Limpiar", use_container_width=True, on_click=lambda: None)
+
+        st.caption("En producción, este flujo debe conectarse a Hercules Auth.")
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.stop()
+
+
+if not st.session_state.logged_in:
+    login_screen()
 
 
 # -------------------------
@@ -329,7 +400,9 @@ index_score = build_market_index(material_signals)
 # Sidebar
 # -------------------------
 st.sidebar.markdown(f"## {APP_TITLE}")
+st.sidebar.success(f"👤 {st.session_state.usuario}")
 st.sidebar.caption("Inteligencia de mercado para la construcción en Guatemala")
+
 page = st.sidebar.radio(
     "Navegación",
     [
@@ -350,16 +423,20 @@ page = st.sidebar.radio(
 )
 
 st.sidebar.markdown("---")
-st.sidebar.markdown(f"**Índice ConstruInteligencia**  \n<span class='mono'>{index_score}/100</span>", unsafe_allow_html=True)
+st.sidebar.markdown(f"**Índice Constru-IA**  \n<span class='mono'>{index_score}/100</span>", unsafe_allow_html=True)
 st.sidebar.progress(index_score / 100)
-st.sidebar.caption(
-    f"Keepalive del navegador: refresco cada {KEEPALIVE_MINUTES} minutos mientras la pestaña siga abierta."
-)
+st.sidebar.caption(f"Refresco automático cada {KEEPALIVE_MINUTES} minutos mientras la pestaña esté abierta.")
 
 if load_api_key():
-    st.sidebar.success(f"OpenRouter listo · {OPENROUTER_MODEL}")
+    st.sidebar.success("OpenRouter conectado")
 else:
     st.sidebar.warning("Configura OPENROUTER_API_KEY en Secrets.")
+
+if st.sidebar.button("🚪 Cerrar sesión", use_container_width=True):
+    st.session_state.logged_in = False
+    st.session_state.usuario = ""
+    st.session_state.rol = ""
+    st.rerun()
 
 # -------------------------
 # Header
@@ -367,11 +444,11 @@ else:
 st.markdown(
     """
     <div class="hero">
-      <div style="font-size:0.9rem; opacity:0.8;">ConstruInteligencia · Guatemala</div>
+      <div style="font-size:0.9rem; opacity:0.8;">Constru-IA · Guatemala</div>
       <h1 style="margin:0.15rem 0 0.4rem 0; font-size:2.2rem;">Plataforma de inteligencia de mercado para la construcción</h1>
       <div style="max-width: 900px; font-size:1rem; line-height:1.55; opacity:0.92;">
         Precios, licencias, importaciones, noticias, señales macroeconómicas y recomendaciones con IA.
-        El modelo está conectado por OpenRouter y la configuración está pensada para Streamlit Cloud.
+        La aplicación está preparada para Streamlit Cloud y no muestra el modelo en la interfaz.
       </div>
     </div>
     """,
@@ -532,7 +609,7 @@ elif page == "Recomendaciones IA":
 
 elif page == "Búsqueda Inteligente":
     st.subheader("Búsqueda Inteligente")
-    st.caption(f"Motor conversacional con el modelo {OPENROUTER_MODEL}.")
+    st.caption("Motor conversacional con OpenRouter; el modelo no se muestra en la interfaz.")
     query = st.text_area(
         "Escribe tu pregunta",
         placeholder="Ej. ¿Cómo ha evolucionado el precio del cemento durante el último año?",
@@ -543,17 +620,17 @@ elif page == "Búsqueda Inteligente":
             st.warning("Escribe una pregunta para continuar.")
         else:
             system_prompt = (
-                "Eres el motor de inteligencia de mercado de ConstruInteligencia. "
+                "Eres el motor de inteligencia de mercado de Constru-IA. "
                 "Responde solo con información verificable, sin inventar datos. "
                 "Si faltan evidencias, dilo de forma explícita. "
                 "No reveles razonamiento interno. "
                 "Enfócate exclusivamente en Guatemala y en el sector construcción."
             )
-            with st.spinner("Consultando OpenRouter..."):
+            with st.spinner("Consultando IA..."):
                 answer = openrouter_answer(system_prompt, query)
             st.success("Respuesta generada")
             st.write(answer)
-            st.caption("La respuesta se genera mediante OpenRouter y el modelo configurado en Secrets.")
+            st.caption("La respuesta se genera mediante OpenRouter y la clave almacenada en Secrets.")
 
 elif page == "Reportes Ejecutivos":
     st.subheader("Reportes Ejecutivos")
@@ -561,8 +638,8 @@ elif page == "Reportes Ejecutivos":
     st.write(f"Generación automática de reporte {freq.lower()} con resumen ejecutivo, alertas, tendencias y fuentes.")
     st.download_button(
         label="Descargar reporte de ejemplo",
-        data="Reporte ejecutivo de ConstruInteligencia - versión demo",
-        file_name="reporte_construinteligencia.txt",
+        data="Reporte ejecutivo de Constru-IA - versión demo",
+        file_name="reporte_constru_ia.txt",
         mime="text/plain",
     )
 
@@ -599,29 +676,27 @@ elif page == "Arquitectura y despliegue":
 - Backend y base de datos: Convex
 - Autenticación: Hercules Auth
 - Pagos y suscripciones: Hercules Commerce
-- IA: OpenRouter con `{OPENROUTER_MODEL}`
+- IA: OpenRouter
 
 **OpenRouter**
 - Endpoint: `https://openrouter.ai/api/v1/chat/completions`
 - Autenticación: `Authorization: Bearer <OPENROUTER_API_KEY>`
-- El modelo se llama exactamente `{OPENROUTER_MODEL}`.
-- OpenRouter documenta compatibilidad con la API estilo OpenAI.
+- El modelo puede configurarse por secreto o variable de entorno.
+- La interfaz no muestra el nombre del modelo.
 
 **Streamlit Cloud**
-- Guarda la API key en `Secrets`.
+- Guarda la API key en `st.secrets`.
 - Usa `st.secrets["OPENROUTER_API_KEY"]`.
-- El refresco automático del navegador ayuda mientras la pestaña sigue abierta.
-- Streamlit Community Cloud ofrece despliegue y administración en la nube con soporte de secretos.
+- El refresco automático ayuda mientras la pestaña sigue abierta.
+- Para despliegue, el archivo principal puede llamarse `streamlit_app.py`.
         """
     )
     st.warning(
-        "Nota importante: el anti-sleep incluido aquí es un refresco del navegador; no garantiza que el host nunca hiberne. Para producción 24/7 suele combinarse con un monitor externo de disponibilidad."
+        "Nota importante: el anti-sleep incluido aquí es un refresco del navegador; no garantiza que el host nunca hiberne."
     )
 
 # -------------------------
 # Footer
 # -------------------------
 st.markdown("---")
-st.caption(
-    "ConstruInteligencia · Demo Streamlit Cloud · Mantén OPENROUTER_API_KEY en Secrets y despliega el archivo como `streamlit_app.py`."
-)
+st.caption("Constru-IA · Demo Streamlit Cloud · IA conectada por OpenRouter · Sesión activa y cierre de sesión incluidos.")
