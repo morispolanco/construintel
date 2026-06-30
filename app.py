@@ -1,3 +1,4 @@
+import io
 import os
 from datetime import date, timedelta
 
@@ -6,6 +7,12 @@ import pandas as pd
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_LEFT
+from reportlab.lib.pagesizes import letter
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import inch
+from reportlab.platypus import Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 # ============================================================
 # Constru-IA · Streamlit Cloud ready
@@ -307,6 +314,101 @@ def build_market_index(material_signals: pd.DataFrame) -> int:
 
 
 @st.cache_data(show_spinner=False)
+def build_realtime_report(period_label: str, price_history_df: pd.DataFrame, news_df: pd.DataFrame, macro_df: pd.DataFrame, material_signals_df: pd.DataFrame, alerts_df: pd.DataFrame) -> dict:
+    top_risk = material_signals_df.sort_values("Riesgo", ascending=False).head(3) if not material_signals_df.empty else pd.DataFrame()
+    summary = {
+        "period": period_label,
+        "generated_at": datetime.now().strftime("%d/%m/%Y %H:%M"),
+        "index_score": build_market_index(material_signals_df),
+        "market_state": risk_label(build_market_index(material_signals_df)),
+        "top_materials": top_risk,
+        "news": news_df.head(5),
+        "macro": macro_df,
+        "alerts": alerts_df.head(8),
+        "price_history": price_history_df,
+    }
+    return summary
+
+
+def generate_pdf_report(report: dict) -> bytes:
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=letter,
+        leftMargin=0.65 * inch,
+        rightMargin=0.65 * inch,
+        topMargin=0.7 * inch,
+        bottomMargin=0.7 * inch,
+    )
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="ReportTitle", parent=styles["Title"], fontName="Helvetica-Bold", fontSize=18, leading=22, alignment=TA_LEFT, spaceAfter=10))
+    styles.add(ParagraphStyle(name="ReportBody", parent=styles["BodyText"], fontName="Helvetica", fontSize=9.5, leading=13, spaceAfter=6))
+    styles.add(ParagraphStyle(name="ReportSmall", parent=styles["BodyText"], fontName="Helvetica", fontSize=8.5, leading=11, textColor=colors.grey))
+    styles.add(ParagraphStyle(name="ReportSection", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=12, leading=14, spaceBefore=10, spaceAfter=6))
+
+    story = []
+    story.append(Paragraph("Constru-IA · Reporte Ejecutivo", styles["ReportTitle"]))
+    story.append(Paragraph(f"Período: {report['period']} · Generado: {report['generated_at']}", styles["ReportSmall"]))
+    story.append(Spacer(1, 0.15 * inch))
+
+    story.append(Paragraph("Resumen ejecutivo", styles["ReportSection"]))
+    story.append(Paragraph(
+        f"Índice Constru-IA: <b>{report['index_score']}/100</b> ({report['market_state']}). "
+        "El reporte resume señales verificables sobre precios, noticias, indicadores macroeconómicos y alertas relevantes del mercado guatemalteco de la construcción.",
+        styles["ReportBody"],
+    ))
+
+    if not report["top_materials"].empty:
+        story.append(Paragraph("Materiales con mayor presión", styles["ReportSection"]))
+        table_data = [["Material", "Precio actual", "Variación", "Estado", "Riesgo"]]
+        for _, row in report["top_materials"].iterrows():
+            table_data.append([str(row["Material"]), str(row["Precio actual"]), str(row["Variación"]), str(row["Estado"]), str(row["Riesgo"])])
+        t = Table(table_data, repeatRows=1)
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#1f2937")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+            ("LEADING", (0, 0), (-1, -1), 10),
+            ("BACKGROUND", (0, 1), (-1, -1), colors.whitesmoke),
+        ]))
+        story.append(t)
+
+    story.append(Paragraph("Indicadores macroeconómicos", styles["ReportSection"]))
+    macro_data = [["Indicador", "Valor", "Lectura"]]
+    for _, row in report["macro"].iterrows():
+        macro_data.append([str(row["Indicador"]), str(row["Valor"]), str(row["Lectura"])])
+    macro_table = Table(macro_data, repeatRows=1)
+    macro_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#111827")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#cbd5e1")),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTSIZE", (0, 0), (-1, -1), 8.5),
+    ]))
+    story.append(macro_table)
+
+    story.append(Paragraph("Alertas críticas", styles["ReportSection"]))
+    alert_text = "<br/>".join([f"• {r['Tema']}: {r['Alerta']} ({r['Prioridad']})" for _, r in report["alerts"].iterrows()])
+    story.append(Paragraph(alert_text or "Sin alertas relevantes en la muestra actual.", styles["ReportBody"]))
+
+    story.append(Paragraph("Noticias relevantes", styles["ReportSection"]))
+    news_text = "<br/>".join([f"• {r['Título']} — {r['Fuente']}" for _, r in report["news"].iterrows()])
+    story.append(Paragraph(news_text or "No hay noticias en la muestra actual.", styles["ReportBody"]))
+
+    story.append(Spacer(1, 0.12 * inch))
+    story.append(Paragraph("Fuentes: Banco de Guatemala, INE, SAT, Ministerio de Economía, Ministerio de Comunicaciones, Cámara Guatemalteca de la Construcción y medios económicos especializados.", styles["ReportSmall"]))
+    story.append(Paragraph("Nota: el contenido se genera a partir de los datos cargados en la sesión y debe conectarse a fuentes verificables en producción.", styles["ReportSmall"]))
+
+    doc.build(story)
+    pdf = buffer.getvalue()
+    buffer.close()
+    return pdf
+
+
+@st.cache_data(show_spinner=False)
 def openrouter_answer(system_prompt: str, user_prompt: str, temperature: float = 0.0, max_tokens: int = 650) -> str:
     api_key = load_api_key()
     model = load_model()
@@ -394,6 +496,16 @@ users_df = generate_users()
 macro_df = generate_macro()
 material_signals = compute_material_signals(price_history)
 index_score = build_market_index(material_signals)
+alerts_df = pd.DataFrame(
+    [
+        ["Hierro", "Incremento significativo", "⛔", "Alta", "Hace 2 horas"],
+        ["PVC", "Problema de abastecimiento", "⚠️", "Media", "Hace 4 horas"],
+        ["Cemento", "Variación por logística", "⚠️", "Media", "Hoy"],
+        ["Tipo de cambio", "Presión sobre importados", "⚠️", "Alta", "Hoy"],
+        ["Aranceles", "Posible cambio regulatorio", "⛔", "Alta", "Ayer"],
+    ],
+    columns=["Tema", "Alerta", "Nivel", "Prioridad", "Actualización"],
+)
 
 
 # -------------------------
@@ -461,6 +573,16 @@ st.write("")
 # Pages
 # -------------------------
 if page == "Panel Ejecutivo":
+    topbar1, topbar2 = st.columns([0.85, 0.15])
+    with topbar2:
+        if st.button("🔄 Actualizar todo", use_container_width=True):
+            st.cache_data.clear()
+            try:
+                st.cache_resource.clear()
+            except Exception:
+                pass
+            st.rerun()
+
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("Índice de riesgo", f"{index_score}/100", delta="mercado actual")
     c2.metric("Alertas activas", "7", delta="2 nuevas")
@@ -519,17 +641,7 @@ elif page == "Historial de Precios":
 
 elif page == "Alertas Críticas":
     st.subheader("Alertas Críticas")
-    alerts = pd.DataFrame(
-        [
-            ["Hierro", "Incremento significativo", "⛔", "Alta", "Hace 2 horas"],
-            ["PVC", "Problema de abastecimiento", "⚠️", "Media", "Hace 4 horas"],
-            ["Cemento", "Variación por logística", "⚠️", "Media", "Hoy"],
-            ["Tipo de cambio", "Presión sobre importados", "⚠️", "Alta", "Hoy"],
-            ["Aranceles", "Posible cambio regulatorio", "⛔", "Alta", "Ayer"],
-        ],
-        columns=["Tema", "Alerta", "Nivel", "Prioridad", "Actualización"],
-    )
-    st.dataframe(alerts, use_container_width=True, hide_index=True)
+    st.dataframe(alerts_df, use_container_width=True, hide_index=True)
     st.caption("En producción, estas alertas pueden disparar correo, SMS o notificaciones internas.")
 
 elif page == "Pronóstico y Radar":
@@ -635,12 +747,44 @@ elif page == "Búsqueda Inteligente":
 elif page == "Reportes Ejecutivos":
     st.subheader("Reportes Ejecutivos")
     freq = st.radio("Frecuencia", ["Semanal", "Mensual", "Trimestral"], horizontal=True)
-    st.write(f"Generación automática de reporte {freq.lower()} con resumen ejecutivo, alertas, tendencias y fuentes.")
-    st.download_button(
-        label="Descargar reporte de ejemplo",
-        data="Reporte ejecutivo de Constru-IA - versión demo",
-        file_name="reporte_constru_ia.txt",
-        mime="text/plain",
+    st.write(f"Reporte real generado con los datos actuales de la sesión: {freq.lower()}.")
+
+    report = build_realtime_report(freq, price_history, news_df, macro_df, material_signals, alerts_df)
+    pdf_bytes = generate_pdf_report(report)
+
+    st.success(
+        f"Índice actual: {report['index_score']}/100 · {report['market_state']}"
+    )
+
+    preview_left, preview_right = st.columns(2)
+    with preview_left:
+        st.markdown("#### Resumen")
+        st.write(
+            "Reporte generado con precios, alertas, noticias, indicadores macroeconómicos y lectura ejecutiva del mercado."
+        )
+        st.write(
+            f"Período: {report['period']} · Generado: {report['generated_at']}"
+        )
+    with preview_right:
+        st.markdown("#### Descarga")
+        st.download_button(
+            label="Descargar PDF",
+            data=pdf_bytes,
+            file_name=f"reporte_constru_ia_{freq.lower()}.pdf",
+            mime="application/pdf",
+            use_container_width=True,
+        )
+
+    st.markdown("#### Datos incluidos")
+    st.dataframe(
+        report["macro"],
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.dataframe(
+        report["alerts"],
+        use_container_width=True,
+        hide_index=True,
     )
 
 elif page == "Administración":
@@ -699,4 +843,4 @@ elif page == "Arquitectura y despliegue":
 # Footer
 # -------------------------
 st.markdown("---")
-st.caption("Constru-IA · Demo Streamlit Cloud · IA conectada por OpenRouter · Sesión activa y cierre de sesión incluidos.")
+st.caption("Constru-IA · Demo Streamlit Cloud · IA conectada por OpenRouter · Sesión activa, cierre de sesión y PDF real incluidos.")
