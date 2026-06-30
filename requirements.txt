@@ -1,0 +1,10 @@
+streamlit>=1.46.0
+pandas>=2.2.2
+openpyxl>=3.1.5
+requests>=2.32.3
+plotly>=5.24.1
+python-dotenv>=1.0.1
+streamlit-authenticator>=0.4.1
+bcrypt>=4.2.0
+xlsxwriter>=3.2.0
+numpy>=2.2.0
